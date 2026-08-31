@@ -29,14 +29,18 @@ hackney_conn_test_() ->
       {"connect timeout", fun test_connect_timeout/0},
       {"connect to invalid host", fun test_connect_invalid/0},
       {"owner death stops connection", fun test_owner_death/0},
-      {"set_owner on closed connection returns invalid_state (#850)",
+      {"set_owner on closed connection returns closed (#850, #932)",
        fun test_set_owner_closed_returns_error/0},
       {"set_owner_async stops a closed pooled connection (#850)",
        fun test_set_owner_async_closed_pooled_stops/0},
       {"request on a dead connection returns {error, closed} (#861)",
        fun test_request_dead_conn_returns_error/0},
       {"body on a dead connection returns {error, closed} (#861)",
-       fun test_body_dead_conn_returns_error/0}
+       fun test_body_dead_conn_returns_error/0},
+      {"request on a connection in closed returns {error, closed} (#932)",
+       fun test_request_closed_conn_returns_closed/0},
+      {"accessors still answer in closed (#932)",
+       fun test_closed_conn_accessors_still_answer/0}
      ]}.
 
 %% Integration tests - use embedded Cowboy server
@@ -256,9 +260,9 @@ test_owner_death() ->
 
 %% #850: when a checkout races a server-side close, the pool calls set_owner on
 %% a connection that has just transitioned to `closed`. It must get
-%% {error, closed} back (so the pool can fall through to a fresh
-%% connection) rather than crash. A non-pooled connection has no grace timer,
-%% so it stays in `closed` to answer.
+%% {error, closed} back (so the pool can fall through to a fresh connection)
+%% rather than crash. A non-pooled connection has no grace timer, so it stays
+%% in `closed` to answer.
 test_set_owner_closed_returns_error() ->
     {Pid, ListenSock} = connected_conn(#{}),
     ?assertEqual({ok, connected}, hackney_conn:get_state(Pid)),
@@ -285,6 +289,46 @@ test_set_owner_async_closed_pooled_stops() ->
 %% #861: a pooled connection can stop between checkout and the call, so a
 %% request to an already-dead connection must return {error, closed} rather
 %% than letting exit:{normal,_}/noproc crash the caller.
+%% #932: a request that races a peer-initiated close lands on a connection
+%% that is still alive in `closed' (the #836 grace window). It used to get the
+%% generic {error, invalid_state}, so the same race answered {error, closed}
+%% when the process had already stopped and {error, invalid_state} when it had
+%% not. Both answers are now {error, closed}.
+test_request_closed_conn_returns_closed() ->
+    {Pid, ListenSock} = connected_conn(#{}),
+    ok = hackney_conn:close(Pid),
+    ?assertEqual({ok, closed}, hackney_conn:get_state(Pid)),
+    ?assertEqual({error, closed},
+                 hackney_conn:request(Pid, <<"GET">>, <<"/">>, [], <<>>)),
+    ?assertEqual({error, closed}, hackney_conn:body(Pid)),
+    hackney_conn:stop(Pid),
+    gen_tcp:close(ListenSock).
+
+%% #932: only calls with no handler answer {error, closed}. The accessors the
+%% pool and hackney read after a response, which is when the peer's close
+%% typically lands, must keep answering. `hackney:location/1' feeds
+%% response_headers straight to hackney_headers, so an error tuple there
+%% crashes it.
+test_closed_conn_accessors_still_answer() ->
+    {Pid, ListenSock} = connected_conn(#{}),
+    ok = hackney_conn:close(Pid),
+    ?assertEqual({ok, closed}, hackney_conn:get_state(Pid)),
+    ?assertEqual(undefined, hackney_conn:response_headers(Pid)),
+    %% reads response_headers when no location is stored
+    ?assertEqual(undefined, hackney:location(Pid)),
+    ?assertEqual(ok, hackney_conn:set_location(Pid, <<"http://127.0.0.1/x">>)),
+    ?assertEqual(<<"http://127.0.0.1/x">>, hackney_conn:get_location(Pid)),
+    ?assertEqual(<<"http://127.0.0.1/x">>, hackney:location(Pid)),
+    ?assertEqual(http1, hackney_conn:get_protocol(Pid)),
+    ?assertEqual(false, hackney_conn:is_upgraded_ssl(Pid)),
+    ?assertEqual(false, hackney_conn:is_no_reuse(Pid)),
+    Info = hackney_conn:checkin_info(Pid),
+    ?assert(is_map(Info)),
+    ?assertEqual(false, maps:get(ready, Info)),
+    ?assertEqual(ok, hackney_conn:close(Pid)),
+    hackney_conn:stop(Pid),
+    gen_tcp:close(ListenSock).
+
 test_request_dead_conn_returns_error() ->
     Pid = dead_conn_pid(),
     ?assertEqual({error, closed},

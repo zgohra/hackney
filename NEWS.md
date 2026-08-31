@@ -1,5 +1,18 @@
 # NEWS
 
+unreleased
+----------
+
+### Fixed
+
+- A request that races a peer-initiated close now returns `{error, closed}`
+  instead of `{error, invalid_state}`. A connection that sees the peer close
+  stays alive briefly so late calls get an answer, and during that window every
+  call without a handler answered with the generic `invalid_state`. The same
+  race therefore had two answers: `{error, closed}` once the connection process
+  was gone, `{error, invalid_state}` while it lingered. Callers can now tell a
+  closed connection from a misuse of the API (#932, #933, thanks @kpy3).
+
 4.7.4 - 2026-08-12
 ------------------
 

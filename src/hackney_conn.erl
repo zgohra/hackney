@@ -598,12 +598,12 @@ release_to_pool(Pid) ->
 %% This updates the process being monitored - if the new owner crashes,
 %% the connection will terminate. Used by the pool when checking out
 %% a connection to a new requester.
--spec set_owner(pid(), pid()) -> ok | {error, invalid_state}.
+-spec set_owner(pid(), pid()) -> ok | {error, closed | invalid_state}.
 set_owner(Pid, NewOwner) ->
     set_owner(Pid, NewOwner, 5000).
 
 %% @doc Set a new owner, waiting at most `Timeout'. @see get_state/2
--spec set_owner(pid(), pid(), timeout()) -> ok | {error, invalid_state}.
+-spec set_owner(pid(), pid(), timeout()) -> ok | {error, closed | invalid_state}.
 set_owner(Pid, NewOwner, Timeout) ->
     gen_statem:call(Pid, {set_owner, NewOwner}, Timeout).
 
@@ -1825,7 +1825,7 @@ closed(enter, _OldState, #conn_data{socket = Socket, transport = Transport, pool
     %% raced the pool checkout race a terminating gen_statem — which
     %% surfaces as `exit:{normal, _}` in the caller (issue #836). Stay
     %% alive briefly so those late calls get a proper `{error, closed}`
-    %% reply via the dedicated closed/3 catch-all clause below, then stop.
+    %% reply via handle_common's closed-state fallback, then stop.
     case PoolPid of
         undefined ->
             {keep_state, Data#conn_data{socket = undefined}};
@@ -1878,14 +1878,6 @@ closed(cast, {set_owner, _NewOwner}, #conn_data{pool_pid = PoolPid} = Data)
     %% now so the pool's monitor removes us from `available` promptly, instead
     %% of lingering through the grace window and being handed out again.
     {stop, normal, Data};
-
-closed({call, From}, _Msg, _Data) ->
-    %% Any other synchronous call arriving during the grace window (request,
-    %% request_async, send_headers, body, stream_body, etc.) gets a proper
-    %% `{error, closed}` instead of the generic `{error, invalid_state}` from
-    %% handle_common. This lets callers distinguish a peer-closed connection
-    %% from a misuse of the API.
-    {keep_state_and_data, [{reply, From, {error, closed}}]};
 
 closed(EventType, Event, Data) ->
     handle_common(EventType, Event, closed, Data).
@@ -2009,6 +2001,14 @@ handle_common({call, From}, checkin_info, _State, Data) ->
 
 handle_common({call, From}, get_protocol, _State, #conn_data{protocol = Protocol}) ->
     {keep_state_and_data, [{reply, From, Protocol}]};
+
+handle_common({call, From}, _, closed, _Data) ->
+    %% #932: a call that reaches a connection already in `closed' (a request
+    %% that raced a peer-initiated close after checkout) is a closed
+    %% connection, not a misuse of the API. Reply with the same
+    %% `{error, closed}' safe_call/3 gives when the process is already gone,
+    %% so the race has one answer instead of two.
+    {keep_state_and_data, [{reply, From, {error, closed}}]};
 
 handle_common({call, From}, _, _State, _Data) ->
     {keep_state_and_data, [{reply, From, {error, invalid_state}}]};
