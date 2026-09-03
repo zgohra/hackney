@@ -598,12 +598,12 @@ release_to_pool(Pid) ->
 %% This updates the process being monitored - if the new owner crashes,
 %% the connection will terminate. Used by the pool when checking out
 %% a connection to a new requester.
--spec set_owner(pid(), pid()) -> ok | {error, invalid_state}.
+-spec set_owner(pid(), pid()) -> ok | {error, closed | invalid_state}.
 set_owner(Pid, NewOwner) ->
     set_owner(Pid, NewOwner, 5000).
 
 %% @doc Set a new owner, waiting at most `Timeout'. @see get_state/2
--spec set_owner(pid(), pid(), timeout()) -> ok | {error, invalid_state}.
+-spec set_owner(pid(), pid(), timeout()) -> ok | {error, closed | invalid_state}.
 set_owner(Pid, NewOwner, Timeout) ->
     gen_statem:call(Pid, {set_owner, NewOwner}, Timeout).
 
@@ -1824,8 +1824,8 @@ closed(enter, _OldState, #conn_data{socket = Socket, transport = Transport, pool
     %% late-arriving {call, From, {request, _}} messages from workers that
     %% raced the pool checkout race a terminating gen_statem — which
     %% surfaces as `exit:{normal, _}` in the caller (issue #836). Stay
-    %% alive briefly so those late calls get a proper `{error, {closed, _}}`
-    %% reply via handle_common's invalid_state fallback, then stop.
+    %% alive briefly so those late calls get a proper `{error, closed}`
+    %% reply via handle_common's closed-state fallback, then stop.
     case PoolPid of
         undefined ->
             {keep_state, Data#conn_data{socket = undefined}};
@@ -2001,6 +2001,14 @@ handle_common({call, From}, checkin_info, _State, Data) ->
 
 handle_common({call, From}, get_protocol, _State, #conn_data{protocol = Protocol}) ->
     {keep_state_and_data, [{reply, From, Protocol}]};
+
+handle_common({call, From}, _, closed, _Data) ->
+    %% #932: a call that reaches a connection already in `closed' (a request
+    %% that raced a peer-initiated close after checkout) is a closed
+    %% connection, not a misuse of the API. Reply with the same
+    %% `{error, closed}' safe_call/3 gives when the process is already gone,
+    %% so the race has one answer instead of two.
+    {keep_state_and_data, [{reply, From, {error, closed}}]};
 
 handle_common({call, From}, _, _State, _Data) ->
     {keep_state_and_data, [{reply, From, {error, invalid_state}}]};
