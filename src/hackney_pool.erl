@@ -76,6 +76,10 @@
     in_use = #{},
     %% Pid to monitor ref mapping: #{Pid => MonitorRef}
     pid_monitors = #{},
+    %% Connections handed to a requester that is still dialing them:
+    %% #{Pid => true}. Their load_regulation slot belongs to the requester,
+    %% who releases it on a failed dial, so a DOWN for one of these must not.
+    dialing = #{},
     %% Hosts that have been activated (prewarm triggered): sets:set(Key)
     activated_hosts = sets:new(),
     %% HTTP/2 connections: #{Key => Pid} - one multiplexed connection per host
@@ -130,15 +134,37 @@ do_checkout(Requester, Host, Port, Transport, Opts) ->
     Pool = find_pool(PoolName, Opts),
     Key = connection_key(Host, Port, Transport),
 
+    PoolInfo = {PoolName, Key, Pool, Transport},
     case gen_server:call(Pool, {checkout, Key, Requester, Opts}, CheckoutTimeout) of
         {ok, Pid} ->
-            %% Return pool info for later checkin
-            PoolInfo = {PoolName, Key, Pool, Transport},
             {ok, PoolInfo, Pid};
+        {ok, Pid, dial} ->
+            %% A fresh conn: the pool only spawned it. Dial from here so a slow
+            %% DNS/TCP connect blocks this requester alone, not every caller
+            %% queued behind the pool gen_server.
+            case dial(Pool, Pid, ConnectTimeout) of
+                ok -> {ok, PoolInfo, Pid};
+                {error, _} = Error -> Error
+            end;
         {error, _} = Error ->
             Error;
         {'EXIT', {timeout, _}} ->
             {error, checkout_timeout}
+    end.
+
+%% @private Connect a conn the pool handed out undialed. On success tell the
+%% pool the dial is over (its slot now follows the normal in_use lifecycle).
+%% On failure hand it back first, so the pool forgets the pid without
+%% releasing the load_regulation slot the requester still owns, then stop it.
+dial(Pool, Pid, ConnectTimeout) ->
+    case connect_connection(Pid, ConnectTimeout) of
+        ok ->
+            gen_server:cast(Pool, {dial_ok, Pid}),
+            ok;
+        {error, Reason} ->
+            catch gen_server:call(Pool, {dial_failed, Pid}, 5000),
+            stop_conn(Pid),
+            {error, Reason}
     end.
 
 %% @doc Checkout a connection for an HTTPS request with SSL pooling enabled.
@@ -170,9 +196,16 @@ do_checkout_ssl(Requester, Host, Port, Transport, Opts) ->
     TlsKey = proplists:get_value(tls_key, Opts, default),
     SslKey = connection_key(Host, Port, Transport, TlsKey),
 
+    PoolInfo = {PoolName, SslKey, Pool, Transport},
     case gen_server:call(Pool, {checkout_ssl, SslKey, Requester, Opts}, CheckoutTimeout) of
+        {ok, Pid, dial_upgrade} ->
+            %% Fresh TCP conn, dialed here (see do_checkout/5) then upgraded by
+            %% the caller like any other needs_upgrade conn.
+            case dial(Pool, Pid, ConnectTimeout) of
+                ok -> {ok, PoolInfo, Pid, needs_upgrade};
+                {error, _} = Error -> Error
+            end;
         {ok, Pid, ConnState} ->
-            PoolInfo = {PoolName, SslKey, Pool, Transport},
             {ok, PoolInfo, Pid, ConnState};
         {error, _} = Error ->
             Error;
@@ -563,7 +596,7 @@ handle_call({checkout, Key, Requester, Opts}, _From, State) ->
                     case start_connection(Key, Requester, Opts, State#state{available=Available2}) of
                         {ok, Pid2, State2} ->
                             InUse2 = maps:put(Pid2, Key, State2#state.in_use),
-                            {reply, {ok, Pid2}, State2#state{in_use=InUse2}};
+                            {reply, {ok, Pid2, dial}, State2#state{in_use=InUse2}};
                         {error, Reason} ->
                             {reply, {error, Reason}, State#state{available=Available2}}
                     end
@@ -580,7 +613,7 @@ handle_call({checkout, Key, Requester, Opts}, _From, State) ->
             case start_connection(Key, Requester, Opts, State) of
                 {ok, Pid, State2} ->
                     InUse2 = maps:put(Pid, Key, State2#state.in_use),
-                    {reply, {ok, Pid}, State2#state{in_use=InUse2}};
+                    {reply, {ok, Pid, dial}, State2#state{in_use=InUse2}};
                 {error, Reason} ->
                     {reply, {error, Reason}, State}
             end
@@ -611,6 +644,18 @@ handle_call({checkout_ssl, SslKey, Requester, Opts}, _From, State) ->
         none ->
             checkout_ssl_fallback(SslKey, Requester, Opts, State)
     end;
+
+handle_call({dial_failed, Pid}, _From, State) ->
+    %% The requester could not connect a conn we spawned for it and is about
+    %% to stop it. Forget the pid; the requester releases its own slot.
+    #state{in_use=InUse, pid_monitors=PidMonitors, dialing=Dialing} = State,
+    case maps:take(Pid, PidMonitors) of
+        {MonRef, PidMonitors2} -> erlang:demonitor(MonRef, [flush]);
+        error -> PidMonitors2 = PidMonitors
+    end,
+    {reply, ok, State#state{in_use=maps:remove(Pid, InUse),
+                            pid_monitors=PidMonitors2,
+                            dialing=maps:remove(Pid, Dialing)}};
 
 handle_call({checkin_sync, Pid}, _From, State) ->
     %% Synchronous checkin - caller waits for acknowledgement
@@ -672,6 +717,11 @@ handle_call(unregister_h2_all, _From, State) ->
 handle_cast({checkin, _PoolInfo, Pid}, State) ->
     State2 = do_checkin(Pid, State),
     {noreply, State2};
+
+handle_cast({dial_ok, Pid}, #state{dialing=Dialing}=State) ->
+    %% Dial finished: from here the conn is an ordinary in_use connection and
+    %% a DOWN releases its slot like any other.
+    {noreply, State#state{dialing=maps:remove(Pid, Dialing)}};
 
 handle_cast({set_maxconn, MaxConn}, State) ->
     {noreply, State#state{max_connections=MaxConn}};
@@ -767,16 +817,23 @@ handle_info({'DOWN', _MonRef, process, Pid, Reason}, State) ->
         Available
     ),
 
-    %% Remove from in_use and release load_regulation slot if it was checked out
+    %% Remove from in_use and release load_regulation slot if it was checked
+    %% out, unless the requester was still dialing it: that slot is released
+    %% by the requester's own error path (see dial/3).
+    Dialing = State#state.dialing,
     InUse2 = case maps:take(Pid, InUse) of
         {Key, NewInUse} ->
-            %% Connection died while in use - release the load_regulation slot
-            {Host, Port} = key_host_port(Key),
-            hackney_load_regulation:release(Host, Port),
+            case maps:is_key(Pid, Dialing) of
+                true -> ok;
+                false ->
+                    {Host, Port} = key_host_port(Key),
+                    hackney_load_regulation:release(Host, Port)
+            end,
             NewInUse;
         error ->
             InUse
     end,
+    Dialing2 = maps:remove(Pid, Dialing),
 
     %% Remove from HTTP/2 connections if present
     H2Conns2 = maps:fold(
@@ -805,6 +862,7 @@ handle_info({'DOWN', _MonRef, process, Pid, Reason}, State) ->
 
     PidMonitors2 = maps:remove(Pid, PidMonitors),
     {noreply, State#state{available=Available2, in_use=InUse2, pid_monitors=PidMonitors2,
+                          dialing=Dialing2,
                           h2_connections=H2Conns2, h3_connections=H3Conns2}};
 
 handle_info(_Info, State) ->
@@ -991,7 +1049,7 @@ start_ssl_checkout_conn(SslKey, Requester, Opts, State) ->
     case start_connection(Host, Port, hackney_tcp, Requester, Opts, State) of
         {ok, Pid, State2} ->
             InUse2 = maps:put(Pid, SslKey, State2#state.in_use),
-            {reply, {ok, Pid, needs_upgrade}, State2#state{in_use=InUse2}};
+            {reply, {ok, Pid, dial_upgrade}, State2#state{in_use=InUse2}};
         {error, Reason} ->
             {reply, {error, Reason}, State}
     end.
@@ -1022,19 +1080,16 @@ start_connection(Host, Port, Transport, Owner, Opts, State) ->
         owner => Owner
     },
 
+    %% The conn is only spawned here. The requester dials it (see dial/3):
+    %% a DNS/TCP connect can take the whole connect_timeout, and doing it in
+    %% this gen_server made every other caller wait behind it, so one slow
+    %% host turned into checkout_timeout for unrelated hosts in the same pool.
     case hackney_conn_sup:start_conn(ConnOpts) of
         {ok, Pid} ->
-            %% Connect the connection
-            case connect_connection(Pid, ConnectTimeout) of
-                ok ->
-                    %% Monitor the process
-                    MonRef = erlang:monitor(process, Pid),
-                    PidMonitors = maps:put(Pid, MonRef, State#state.pid_monitors),
-                    {ok, Pid, State#state{pid_monitors=PidMonitors}};
-                {error, Reason} ->
-                    stop_conn(Pid),
-                    {error, Reason}
-            end;
+            MonRef = erlang:monitor(process, Pid),
+            PidMonitors = maps:put(Pid, MonRef, State#state.pid_monitors),
+            Dialing = maps:put(Pid, true, State#state.dialing),
+            {ok, Pid, State#state{pid_monitors=PidMonitors, dialing=Dialing}};
         {error, Reason} ->
             {error, Reason}
     end.

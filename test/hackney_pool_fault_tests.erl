@@ -56,6 +56,8 @@ pool_fault_test_() ->
                fun t_crash_mid_request/1),
       scenario("a connection killed while checked out does not crash the pool",
                fun t_kill_checked_out_connection/1),
+      scenario("a slow dial to one host does not stall checkouts for another",
+               fun t_slow_dial_does_not_block_pool/1),
       scenario("a fault storm never takes the pool down", 60,
                fun t_fault_storm/1)
       ]}}.
@@ -121,6 +123,38 @@ t_connect_hangs(Baseline) ->
     %% Back well before the transport finishes hanging: the checkout deadline
     %% plus the bounded stop, not the 1.5s the transport sits there for.
     ?assert(Elapsed div 1000 < 800),
+    assert_pool_healthy(Baseline).
+
+%% Head-of-line blocking: the pool used to run the dial inside its own
+%% gen_server, so while one requester waited on a slow DNS/TCP connect every
+%% other checkout in the pool queued behind it and hit checkout_timeout for
+%% hosts that were perfectly reachable. Dialing now happens in the requester.
+t_slow_dial_does_not_block_pool(Baseline) ->
+    hackney_fault_transport:set(connect, {sleep, 1000}),
+    Self = self(),
+    Slow = spawn_link(fun() ->
+                              Self ! {slow, checkout([{connect_timeout, 3000}])}
+                      end),
+    timer:sleep(50),
+    %% Plain TCP to the real listener: a different key in the same pool, on a
+    %% deadline far shorter than the dial in flight.
+    Opts = [{pool, ?POOL}, {connect_timeout, 500}, {checkout_timeout, 300}],
+    {Elapsed, Fast} = timer:tc(fun() ->
+                                       hackney_pool:checkout(?HOST, ?PORT, hackney_tcp, Opts)
+                               end),
+    ?assertMatch({ok, _, _}, Fast),
+    ?assert(Elapsed div 1000 < 300),
+    {ok, FastInfo, FastPid} = Fast,
+    ok = hackney_pool:checkin(FastInfo, FastPid),
+    receive
+        {slow, {ok, SlowInfo, SlowPid}} ->
+            ok = hackney_pool:checkin(SlowInfo, SlowPid);
+        {slow, Other} ->
+            erlang:error({slow_checkout_failed, Other})
+    after 5000 ->
+            exit(Slow, kill),
+            erlang:error(slow_checkout_never_returned)
+    end,
     assert_pool_healthy(Baseline).
 
 t_connect_crashes(Baseline) ->
