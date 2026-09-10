@@ -178,13 +178,13 @@ test_default_pool() ->
     ok = hackney_pool:stop_pool(test_pool_1).
 
 test_custom_pool() ->
-    %% Timeout is capped at 2000ms for keepalive
+    %% The configured keepalive is honored as given (no 2s cap)
     Options = [{pool_size, 10}, {timeout, 60000}],
     ok = hackney_pool:start_pool(test_pool_2, Options),
     Pool = hackney_pool:find_pool(test_pool_2),
     ?assert(is_pid(Pool)),
     ?assertEqual(10, hackney_pool:max_connections(test_pool_2)),
-    ?assertEqual(2000, hackney_pool:timeout(test_pool_2)),  % Capped at 2s
+    ?assertEqual(60000, hackney_pool:timeout(test_pool_2)),
     ok = hackney_pool:stop_pool(test_pool_2).
 
 test_pool_stats() ->
@@ -206,15 +206,14 @@ test_max_connections() ->
     ok = hackney_pool:stop_pool(test_pool_4).
 
 test_timeout_setting() ->
-    %% Keepalive timeout is capped at 2000ms
     ok = hackney_pool:start_pool(test_pool_5, [{timeout, 5000}]),
-    ?assertEqual(2000, hackney_pool:timeout(test_pool_5)),  % Capped at 2s
+    ?assertEqual(5000, hackney_pool:timeout(test_pool_5)),
     hackney_pool:set_timeout(test_pool_5, 1000),
     timer:sleep(10),
     ?assertEqual(1000, hackney_pool:timeout(test_pool_5)),
     hackney_pool:set_timeout(test_pool_5, 10000),
     timer:sleep(10),
-    ?assertEqual(2000, hackney_pool:timeout(test_pool_5)),  % Capped at 2s
+    ?assertEqual(10000, hackney_pool:timeout(test_pool_5)),
     ok = hackney_pool:stop_pool(test_pool_5).
 
 %%====================================================================

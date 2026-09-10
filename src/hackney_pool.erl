@@ -94,7 +94,7 @@
 }).
 
 -define(DEFAULT_MAX_CONNECTIONS, 50).
--define(DEFAULT_KEEPALIVE_TIMEOUT, 2000).  % 2 seconds max idle
+-define(DEFAULT_KEEPALIVE_TIMEOUT, 2000).  % default idle before a pooled conn closes
 -define(DEFAULT_PREWARM_COUNT, 4).         % Connections to maintain per host
 -define(STOP_CONN_TIMEOUT, 100).           % Max wait for a conn to stop
 -define(PREWARM_CONNECT_TIMEOUT, 5000).    % Dial budget for a prewarm conn
@@ -504,15 +504,18 @@ init([Name, Options]) ->
                   Size ->
                       Size
               end,
-    %% keepalive_timeout: max idle time for pooled connections (capped at 2s)
-    %% Also accept 'timeout' for backward compatibility
-    RawTimeout = case proplists:get_value(keepalive_timeout, Options) of
-                     undefined ->
-                         proplists:get_value(timeout, Options, ?DEFAULT_KEEPALIVE_TIMEOUT);
-                     KT ->
-                         KT
-                 end,
-    KeepaliveTimeout = min(RawTimeout, ?DEFAULT_KEEPALIVE_TIMEOUT),
+    %% keepalive_timeout: max idle time for pooled connections. Also accepts
+    %% 'timeout' (the 1.x name, and the app env key applied by start_link/2).
+    %% Not capped: the 2s ceiling this used to impose meant nearly every request
+    %% re-dialed (DNS + TCP + TLS), which is exactly the path that fails under
+    %% a flaky resolver or network. Callers pick a value below their servers'
+    %% idle timeout; is_ready/1 still rejects a conn the peer already closed.
+    KeepaliveTimeout = case proplists:get_value(keepalive_timeout, Options) of
+                           undefined ->
+                               proplists:get_value(timeout, Options, ?DEFAULT_KEEPALIVE_TIMEOUT);
+                           KT ->
+                               KT
+                       end,
 
     %% prewarm_count: number of TCP connections to maintain per host
     %% Check pool options first, then app env, then default
@@ -727,9 +730,7 @@ handle_cast({set_maxconn, MaxConn}, State) ->
     {noreply, State#state{max_connections=MaxConn}};
 
 handle_cast({set_timeout, NewTimeout}, State) ->
-    %% Cap at 2 seconds
-    Capped = min(NewTimeout, ?DEFAULT_KEEPALIVE_TIMEOUT),
-    {noreply, State#state{keepalive_timeout=Capped}};
+    {noreply, State#state{keepalive_timeout=NewTimeout}};
 
 handle_cast({prewarm, Host, Port}, #state{prewarm_count=Count}=State) ->
     State2 = do_prewarm(Host, Port, Count, State),
